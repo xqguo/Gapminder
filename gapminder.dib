@@ -1,0 +1,173 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"name":"csharp"}]}}
+
+#!fsharp
+
+#r "nuget: FSharp.Data"
+#r "nuget: Deedle"
+#r "nuget: Plotly.NET"
+#r "nuget: Plotly.NET.Interactive"
+#r "nuget:Plotly.NET.ImageExport"
+open FSharp.Data
+open System
+open System.IO
+open Deedle
+open Plotly.NET
+open Plotly.NET.LayoutObjects
+open Plotly.NET.ImageExport
+
+#!fsharp
+
+//enable paraellel and cache
+type WorldBank = WorldBankDataProvider<"World Development Indicators", Asynchronous=true>
+let wb = WorldBank.GetDataContext()
+
+#!fsharp
+
+let yrs = [|1950 .. 2021|]
+
+#!fsharp
+
+let getdf refresh =    
+    if refresh then
+        let df =   
+            // [for c in countries ->
+            [for c in wb.Countries ->
+                // let c = wb.Countries.Singapore
+                async{
+                    let! s = c.Indicators.``Life expectancy at birth, total (years)``
+                    let s' = 
+                        s
+                        |> Seq.filter( fun (y,_) -> Array.contains y yrs )
+                        |> Series.ofObservations
+                    let! gdp = c.Indicators.``GDP per capita (constant 2015 US$)``
+                    let gdp' = 
+                        gdp
+                        |> Seq.filter( fun (y,_) -> Array.contains y yrs )
+                        |> Series.ofObservations
+                    let! pop = c.Indicators.``Population, total``
+                    let pop' = 
+                        pop
+                        |> Seq.filter( fun (y,_) -> Array.contains y yrs )
+                        |> Series.ofObservations
+                    let ct = Series.mapValues (fun _ -> c.Name) pop' 
+                    let reg = Series.mapValues (fun _ -> c.Region) pop' 
+                    let df = Frame.ofColumns [
+                                "lifeExp" => s'; 
+                                "gdpPercap" => gdp';
+                                "pop" => pop']
+                    df.AddColumn( "country", ct)
+                    df.AddColumn( "continent", reg)
+                    let year = gdp' |> Series.map( fun k v -> k ) 
+                    df.AddColumn( "year", year)
+                    return df.Rows.Values}]
+            |> Async.Parallel
+            |> Async.RunSynchronously
+            |> Seq.collect id
+            |> Frame.ofRowsOrdinal
+            |> Frame.dropSparseRows
+            |> Frame.mapRowKeys int
+        df.SaveCsv("gapminder.csv", includeRowKeys = false)
+        df
+    else
+        Frame.ReadCsv("gapminder.csv") 
+
+#!fsharp
+
+let df = getdf false
+
+#!fsharp
+
+let continents =  (df.GetColumn<string> "continent").Values |> Seq.distinct |> Seq.sort |> Seq.toArray
+let steps = (df.GetColumn<int> "year").Values |> Seq.distinct |> Seq.sort |> Seq.toArray
+
+#!fsharp
+
+let sliderSteps steps  continents =
+    let nc = continents |> Array.length
+    let ns = steps |> Array.length
+    steps
+    |> Seq.indexed
+    |> Seq.map (fun (i, step) ->
+        // Create a visibility and a title parameter
+        // The visibility parameter includes an array where every parameter
+        // is mapped onto the trace visibility
+        let visible =
+            // Set true only for the current step
+            // (fun index -> index = i) |> Array.init (steps.Length ) |> box
+            (fun index -> index >= i * nc && index < ( i + 1 )* nc ) 
+            |> Array.init (ns * nc) 
+            |> box
+
+        let title = sprintf "Year: %i" step |> box
+
+        SliderStep.init (
+            Args = [ "visible", visible; "title", title ],
+            Method = StyleParam.Method.Update,
+            Label = string (step)
+        ))
+
+#!fsharp
+
+let slider =
+    Slider.init (
+        CurrentValue = SliderCurrentValue.init (Prefix = "Year: "),
+        Padding = Padding.init (T = 50),
+        Steps = sliderSteps steps continents
+    )
+
+#!fsharp
+
+let scattersChart df steps continents=
+    let hoverTemplate = "<i>GDP Percap</i>: %{x:.2f}"+
+                        "<br><i>Life Exp</i>: %{y:.2f}"+
+                        "<br><i>Country</i>: %{text}" 
+
+    let xaxis = LinearAxis.init(AxisType=StyleParam.AxisType.Log, Range = StyleParam.Range.ofMinMax((2, 5)))
+    let yaxis = LinearAxis.init(AxisType=StyleParam.AxisType.Linear, Range=StyleParam.Range.ofMinMax( 20, 90))
+    steps
+    |> Seq.map (fun year ->
+        // Create a scatter plot for every step
+        // Some plot must be visible here or the chart is empty at the beginning
+        let chartVisibility =
+            if year = (steps |> Seq.min) then
+                StyleParam.Visible.True
+            else
+                StyleParam.Visible.False
+
+        let go = 
+            continents
+            |> Seq.map( fun k -> 
+                let data= 
+                    df 
+                    |> Frame.filterRowValues( fun o -> 
+                        (o.GetAs<int> "year" = year) && 
+                        ((o.GetAs<string> "continent") = k)) 
+                let x = (data?gdpPercap).Values
+                let y = data?lifeExp.Values
+                let s = data?pop.Values
+                let n = (data.GetColumn<string> "country").Values
+                let s' = s |> Seq.map( fun x -> max 8 (x**0.3 /10. |> int) )
+                Chart.Bubble( x, y, s', Name = k) 
+                |> Chart.withXAxis xaxis
+                |> Chart.withYAxis yaxis
+                |> GenericChart.mapTrace  (Trace2DStyle.Scatter(HoverTemplate=hoverTemplate,MultiText=n))
+                )
+            |> Chart.combine
+            |> Chart.withTraceInfo (Visible = chartVisibility)
+        go)
+    |> Chart.combine
+    |> Chart.withSize(800,600)
+
+#!fsharp
+
+let c = scattersChart df steps continents |> Chart.withSlider slider
+
+#!fsharp
+
+c
+
+#!fsharp
+
+c |> Chart.saveHtml("gapminder.html")
